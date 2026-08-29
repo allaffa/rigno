@@ -4,7 +4,7 @@ h5py
 jax # [cuda12]
 jraph
 matplotlib
-numpy
+numpy>=2,<3
 optax
 pandas
 pytest

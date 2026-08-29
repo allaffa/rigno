@@ -27,7 +27,7 @@ fi
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "Error: '${PYTHON_BIN}' was not found." >&2
-  echo "Install Python 3.10 or newer, including the venv module." >&2
+  echo "Install Python 3.11 or newer, including the venv module." >&2
   exit 1
 fi
 
@@ -37,8 +37,8 @@ if [[ ! -f "${REQUIREMENTS_FILE}" ]]; then
 fi
 
 PYTHON_VERSION="$(${PYTHON_BIN} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-if ! "${PYTHON_BIN}" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
-  echo "Error: Python 3.10 or newer is required; found ${PYTHON_VERSION}." >&2
+if ! "${PYTHON_BIN}" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'; then
+  echo "Error: Python 3.11 or newer is required; found ${PYTHON_VERSION}." >&2
   exit 1
 fi
 

@@ -56,12 +56,13 @@ On Linux, create the virtual environment and install all dependencies with:
 source .venv/bin/activate
 ```
 
-The installer uses `requirements.txt`, requires Python 3.10 or newer, and
+The installer uses `requirements.txt`, requires Python 3.11 or newer and NumPy
+2.x, and
 verifies the PyTorch and PyTorch Geometric imports. Set `RIGNO_PYTHON` to use a
 specific Python executable or `RIGNO_VENV_DIR` to choose another environment
 location:
 ```bash
-RIGNO_PYTHON=python3.12 RIGNO_VENV_DIR=.venv-rigno ./install_linux.sh
+RIGNO_PYTHON=python3.11 RIGNO_VENV_DIR=.venv-rigno ./install_linux.sh
 ```
 
 For a manual installation, create and activate a fresh virtual environment:
