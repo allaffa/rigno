@@ -6,6 +6,7 @@ from typing import Union
 import flax.typing
 import jax
 import jax.numpy as jnp
+from torch import nn
 
 from rigno.models.operator import AbstractOperator, Inputs
 from rigno.utils import Array, is_multiple, normalize, unnormalize
@@ -14,6 +15,11 @@ class Stepper(ABC):
   """Abstract class for a time-stepping scheme."""
 
   def __init__(self, operator: AbstractOperator):
+    if isinstance(operator, nn.Module):
+      raise RuntimeError(
+        "The legacy JAX stepping stack is not compatible with PyTorch operators; "
+        "PyTorch training and time stepping are deferred to phase two."
+      )
     self._apply_operator = operator.apply
 
   def normalize_inputs(self, stats, inputs: Inputs) -> Inputs:

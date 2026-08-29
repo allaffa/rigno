@@ -44,10 +44,32 @@ The `example.ipynb` notebook provides a minimal example on how to use the codes.
 
 ## Usage
 
-Create and activate a fresh virtual environment:
+> **PyTorch Geometric port:** The `pytorch-geometric-port` branch currently
+> contains the converted RIGNO graph builder, model, and message-passing stack.
+> Dataset loading, training, evaluation, time stepping, and legacy Flax checkpoint
+> conversion have not yet been ported. The legacy JAX training entry points are
+> intentionally unavailable with the PyTorch model until phase two. New PyTorch
+> checkpoints are not compatible with Flax checkpoints.
+
+On Linux, create the virtual environment and install all dependencies with:
 ```bash
-python -m venv venv-rigno
-source venv-rigno/bin/activate
+./install_linux.sh
+source .venv/bin/activate
+```
+
+The installer uses `requirements.txt`, requires Python 3.11 or newer and NumPy
+2.x, and
+verifies the PyTorch and PyTorch Geometric imports. Set `RIGNO_PYTHON` to use a
+specific Python executable or `RIGNO_VENV_DIR` to choose another environment
+location:
+```bash
+RIGNO_PYTHON=python3.11 RIGNO_VENV_DIR=.venv-rigno ./install_linux.sh
+```
+
+For a manual installation, create and activate a fresh virtual environment:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
 Install the necessary packages:

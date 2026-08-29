@@ -1,41 +1,31 @@
-"""Abstract (learnable) operator."""
+"""Abstract learnable operator interfaces."""
 
-from typing import Union, NamedTuple
-
-from flax import linen as nn
-
-from rigno.utils import Array
+from typing import NamedTuple
+import torch
+from torch import nn
 
 
 class Inputs(NamedTuple):
-  """Structured of the inputs of an operator."""
+    """Inputs consumed by a neural PDE solution operator.
 
-  u: Array
-  c: Union[Array, None]
-  x_inp: Array
-  x_out: Array
-  t: Union[Array, float, None]
-  tau: Union[Array, float, None]
+    ``u`` and optional coefficients ``c`` use shape ``[B, 1, N_in, C]``.
+    ``x_inp`` and ``x_out`` contain input/output coordinates with shape
+    ``[B or 1, 1, N, D]``. ``t`` and ``tau`` are optional current-time and
+    lead-time values, normally one scalar per batch sample.
+    """
+
+    u: torch.Tensor
+    c: torch.Tensor | None
+    x_inp: torch.Tensor
+    x_out: torch.Tensor
+    t: torch.Tensor | float | None
+    tau: torch.Tensor | float | None
+
 
 class AbstractOperator(nn.Module):
-  """Abstract class for a learnable operator."""
+    """Base class for PyTorch neural operators with serializable configuration."""
 
-  def setup(self):
-    raise NotImplementedError
-
-  def __call__(self,
-    inputs: Inputs,
-    **kwargs,
-  ) -> Array:
-    return self.call(inputs, **kwargs)
-
-  def call(self, inputs: Inputs) -> Array:
-    raise NotImplementedError
-
-  @property
-  def configs(self):
-    configs = {
-      attr: self.__getattr__(attr)
-      for attr in self.__annotations__.keys() if attr != 'parent'
-    }
-    return configs
+    @property
+    def configs(self):
+        """Return a detached dictionary of constructor configuration values."""
+        return dict(self._configs)

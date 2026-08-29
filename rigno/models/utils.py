@@ -1,101 +1,87 @@
-"""Utility functions that are used in."""
+"""PyTorch neural-network utilities."""
 
-from typing import Sequence, Callable
+from collections.abc import Sequence
+import torch
+from torch import nn
 
-import flax.linen as nn
-import jax.numpy as jnp
-import jax.tree_util as tree
-
-
-def concatenate_args(args, kwargs, axis: int = -1):
-  """Concatenates all positional and keyword arguments on the given axis."""
-
-  combined_args = tree.tree_flatten(args)[0] + tree.tree_flatten(kwargs)[0]
-  concat_args = jnp.concatenate(combined_args, axis=axis)
-  return concat_args
-
-class FeedForwardBlock(nn.Module):
-  """
-  Multi-layer perceptron with optional layer norm and learned distribution correction
-  on the last layer. Activation is applied on all layers except the last one. Multiple
-  inputs are concatenated before being fed to the MLP.
-  """
-
-  layer_sizes: Sequence[int]
-  activation: Callable
-  use_layer_norm: bool = False
-  use_conditional_norm: bool = False
-  cond_norm_hidden_size: int = 4
-  concatenate_axis: int = -1
-
-  def setup(self):
-    # Set up layers
-    self.layers = [nn.Dense(features) for features in self.layer_sizes]
-
-    # Set up normalization layer
-    self.layernorm = nn.LayerNorm(
-      reduction_axes=-1,
-      feature_axes=-1,
-      use_scale=True,
-      use_bias=True,
-    ) if self.use_layer_norm else None
-
-    # Set conditional normalization layer
-    self.correction = None
-    if self.use_conditional_norm:
-      self.correction = ConditionedNorm(
-        latent_size=self.cond_norm_hidden_size,
-        correction_size=self.layer_sizes[-1],
-      )
-
-  def __call__(self, *args, c = None, **kwargs):
-    x = concatenate_args(args=args, kwargs=kwargs, axis=self.concatenate_axis)
-    for layer in self.layers[:-1]:
-      x = layer(x)
-      x = self.activation(x)
-    x = self.layers[-1](x)
-    if self.layernorm:
-      x = self.layernorm(x)
-    if self.correction:
-      assert c is not None
-      x = self.correction(c=c, x=x)
-    return x
 
 class ConditionedNorm(nn.Module):
-  """
-  Learned correction layer is designed to be applied after a normalization layer.
-  Based on an input (e.g., lead time), it shifts and scales the distribution of its input.
-  correction_size must either be 1 or the same as one of the input dimensions (broadcastable).
-  """
+    """Apply a learned affine correction controlled by a scalar condition.
 
-  latent_size: Sequence[int]
-  correction_size: int = 1
+    Two small networks map one condition per sample to multiplicative and
+    additive corrections. The correction broadcasts over any node or edge
+    dimensions in ``x`` while preserving its final feature dimension.
+    """
 
-  def setup(self):
-    self.mlp_scale = nn.Sequential(
-      layers=[
-        nn.Dense(self.latent_size,
-                 kernel_init=nn.initializers.normal(stddev=.01)),
-        nn.sigmoid,
-        nn.Dense(self.correction_size,
-                 kernel_init=nn.initializers.normal(stddev=.01)),
-      ])
-    self.mlp_bias = nn.Sequential(
-      layers=[
-        nn.Dense(self.latent_size,
-                 kernel_init=nn.initializers.normal(stddev=.01)),
-        nn.sigmoid,
-        nn.Dense(self.correction_size,
-                 kernel_init=nn.initializers.normal(stddev=.01)),
-      ])
+    def __init__(self, latent_size: int, correction_size: int):
+        super().__init__()
+        self.scale = nn.Sequential(
+            nn.Linear(1, latent_size), nn.Sigmoid(), nn.Linear(latent_size, correction_size)
+        )
+        self.bias = nn.Sequential(
+            nn.Linear(1, latent_size), nn.Sigmoid(), nn.Linear(latent_size, correction_size)
+        )
+        for module in (self.scale[0], self.scale[2], self.bias[0], self.bias[2]):
+            nn.init.normal_(module.weight, std=0.01)
+            nn.init.zeros_(module.bias)
 
-  def __call__(self, c, x):
-    scale = 1 + c * self.mlp_scale(c)
-    bias = c * self.mlp_bias(c)
-    shape = x.shape
-    x = x.reshape(shape[0], -1, shape[-1])
-    scale = jnp.expand_dims(scale, axis=1)
-    bias = jnp.expand_dims(bias, axis=1)
-    x = x * scale + bias
-    x = x.reshape(*shape)
-    return x
+    def forward(self, x, condition):
+        """Condition ``x`` and return a tensor of the same shape.
+
+        Args:
+            x: Feature tensor whose first axis is the sample/item axis and whose
+                final axis has ``correction_size`` entries.
+            condition: Scalar condition for each item in the first axis.
+        """
+        condition = condition.reshape(condition.shape[0], -1)[:, :1].to(
+            dtype=x.dtype, device=x.device
+        )
+        scale, bias = 1 + condition * self.scale(condition), condition * self.bias(condition)
+        while scale.ndim < x.ndim:
+            scale, bias = scale.unsqueeze(1), bias.unsqueeze(1)
+        return x * scale + bias
+
+
+class FeedForwardBlock(nn.Module):
+    """Configurable MLP used for graph embeddings and residual updates.
+
+    Input tensors are concatenated along their feature axis. The first linear
+    layer is lazy so the input width can be inferred on first use; output widths
+    are supplied through ``layer_sizes``. SiLU activations separate linear
+    layers, with optional LayerNorm and condition-dependent affine correction
+    applied to the final representation.
+    """
+
+    def __init__(
+        self,
+        layer_sizes: Sequence[int],
+        use_layer_norm=False,
+        use_conditional_norm=False,
+        cond_norm_hidden_size=16,
+    ):
+        super().__init__()
+        if not layer_sizes:
+            raise ValueError("layer_sizes cannot be empty")
+        layers = []
+        for index, size in enumerate(layer_sizes):
+            layers.append(
+                nn.LazyLinear(size) if index == 0 else nn.Linear(layer_sizes[index - 1], size)
+            )
+            if index < len(layer_sizes) - 1:
+                layers.append(nn.SiLU())
+        self.layers = nn.Sequential(*layers)
+        self.norm = nn.LayerNorm(layer_sizes[-1]) if use_layer_norm else nn.Identity()
+        self.conditioned_norm = (
+            ConditionedNorm(cond_norm_hidden_size, layer_sizes[-1])
+            if use_conditional_norm
+            else None
+        )
+
+    def forward(self, *inputs, condition=None):
+        """Concatenate compatible inputs and produce the configured features."""
+        output = self.norm(self.layers(torch.cat(inputs, dim=-1)))
+        if self.conditioned_norm is not None:
+            if condition is None:
+                raise ValueError("condition is required when conditional normalization is enabled")
+            output = self.conditioned_norm(output, condition)
+        return output
