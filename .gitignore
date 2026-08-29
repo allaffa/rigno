@@ -169,4 +169,5 @@ tmp.*
 *tmp_*.*
 *.job
 *.sh
+!install_linux.sh
 data/

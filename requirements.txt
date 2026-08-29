@@ -7,7 +7,8 @@ matplotlib
 numpy
 optax
 pandas
+pytest
 seaborn
 scipy
-torch
-torch-geometric
+torch>=2.13
+torch-geometric>=2.8.0
