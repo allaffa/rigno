@@ -244,7 +244,9 @@ class RIGNO(AbstractOperator):
         )
         self.encoder = BipartiteGraphNet(*common)
         self.processor = ProcessorGraphNet(processor_steps, *common)
-        self.decoder = BipartiteGraphNet(*common, embed_nodes=False)
+        self.decoder = BipartiteGraphNet(
+            *common, embed_nodes=False, embed_sender=False, embed_receiver=True
+        )
         self.output_projection = FeedForwardBlock(
             [node_latent_size] * mlp_hidden_layers + [num_outputs]
         )
@@ -285,7 +287,16 @@ class RIGNO(AbstractOperator):
         device, dtype = inputs.u.device, inputs.u.dtype
         graphs = graphs.to(device)
         features = inputs.u[:, 0]
+        input_node_count = graphs.p2r.node_features["pnodes"].shape[0]
+        if points != input_node_count:
+            raise ValueError(
+                f"inputs.u has {points} points, but the p2r graph expects {input_node_count}"
+            )
         if inputs.c is not None:
+            if inputs.c.ndim != 4 or inputs.c.shape[:3] != inputs.u.shape[:3]:
+                raise ValueError(
+                    "inputs.c must have shape [batch, 1, points, channels] matching inputs.u"
+                )
             features = torch.cat([features, inputs.c[:, 0]], dim=-1)
         t, tau = self._channel(inputs.t, batch, device, dtype), self._channel(
             inputs.tau, batch, device, dtype
@@ -321,13 +332,12 @@ class RIGNO(AbstractOperator):
         latent_r = self.processor(latent_r, edge_index, edge_attr.to(dtype), condition)
         edge = graphs.r2p.edge_by_name("r2p")
         edge_index, edge_attr = self._masked(edge)
-        out_count = graphs.r2p.node_features["pnodes"].shape[0]
-        receiver = (
-            latent_p
-            if latent_p.shape[1] == out_count
-            else torch.zeros(batch, out_count, latent_p.shape[-1], device=device, dtype=dtype)
+        output_struct = (
+            graphs.r2p.node_features["pnodes"].to(dtype).unsqueeze(0).expand(batch, -1, -1)
         )
-        _, decoded = self.decoder(latent_r, receiver, edge_index, edge_attr.to(dtype), condition)
+        _, decoded = self.decoder(
+            latent_r, output_struct, edge_index, edge_attr.to(dtype), condition
+        )
         self.intermediates = {
             "pnodes_encoded": latent_p,
             "rnodes_encoded": encoded_r,

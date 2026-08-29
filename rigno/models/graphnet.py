@@ -15,14 +15,18 @@ class BipartiteGraphNet(nn.Module):
         conditioned_normalization,
         cond_norm_hidden_size,
         embed_nodes=True,
+        embed_sender=None,
+        embed_receiver=None,
     ):
         super().__init__()
+        embed_sender = embed_nodes if embed_sender is None else embed_sender
+        embed_receiver = embed_nodes if embed_receiver is None else embed_receiver
         sizes = [node_latent_size] * (mlp_hidden_layers + 1)
         self.sender_embed = (
-            FeedForwardBlock(sizes, use_layer_norm=True) if embed_nodes else nn.Identity()
+            FeedForwardBlock(sizes, use_layer_norm=True) if embed_sender else nn.Identity()
         )
         self.receiver_embed = (
-            FeedForwardBlock(sizes, use_layer_norm=True) if embed_nodes else nn.Identity()
+            FeedForwardBlock(sizes, use_layer_norm=True) if embed_receiver else nn.Identity()
         )
         self.edge_embed = FeedForwardBlock(
             [edge_latent_size] * (mlp_hidden_layers + 1), use_layer_norm=True
@@ -72,17 +76,5 @@ class ProcessorGraphNet(nn.Module):
     def forward(self, nodes, edge_index, edge_attr, condition=None):
         batched_edges = self.edge_embed(edge_attr).unsqueeze(0).expand(nodes.shape[0], -1, -1)
         for layer in self.layers:
-            node_parts, edge_parts = [], []
-            for batch_index in range(nodes.shape[0]):
-                cond = None if condition is None else condition[batch_index : batch_index + 1]
-                node, edge = layer(
-                    nodes[batch_index : batch_index + 1],
-                    nodes[batch_index : batch_index + 1],
-                    edge_index,
-                    batched_edges[batch_index],
-                    cond,
-                )
-                node_parts.append(node[0])
-                edge_parts.append(edge[0])
-            nodes, batched_edges = torch.stack(node_parts), torch.stack(edge_parts)
+            nodes, batched_edges = layer(nodes, nodes, edge_index, batched_edges, condition)
         return nodes

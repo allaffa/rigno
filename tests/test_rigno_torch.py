@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from rigno.models.operator import Inputs
@@ -82,6 +83,55 @@ def test_graph_builder_uses_multiscale_edges():
     edges_one = one.build_metadata(coordinates, coordinates, domain, seed=5).r2r_edge_indices
     edges_two = two.build_metadata(coordinates, coordinates, domain, seed=5).r2r_edge_indices
     assert len(edges_two) >= len(edges_one)
+
+
+def test_rigno_rejects_input_mesh_size_mismatch():
+    rng = np.random.default_rng(13)
+    coordinates = rng.uniform(0, 1, size=(32, 2)).astype(np.float32)
+    builder = RegionInteractionGraphBuilder(False, 1, 2, 1.5, 1.5, 4)
+    graphs = builder.build_graphs(
+        builder.build_metadata(coordinates, coordinates, np.array([[0, 0], [1, 1]]))
+    )
+    model = RIGNO(num_outputs=1, processor_steps=1, node_latent_size=8, edge_latent_size=8)
+    inputs = Inputs(
+        u=torch.randn(2, 1, 31, 1),
+        c=None,
+        x_inp=None,
+        x_out=None,
+        t=torch.zeros(2, 1),
+        tau=torch.ones(2, 1),
+    )
+    with pytest.raises(ValueError, match="31 points.*p2r graph expects 32"):
+        model(inputs, graphs)
+
+
+def test_rigno_supports_distinct_output_mesh():
+    rng = np.random.default_rng(17)
+    coordinates_in = rng.uniform(0, 1, size=(40, 2)).astype(np.float32)
+    coordinates_out = rng.uniform(0, 1, size=(23, 2)).astype(np.float32)
+    builder = RegionInteractionGraphBuilder(False, 1, 2, 1.5, 1.5, 4)
+    graphs = builder.build_graphs(
+        builder.build_metadata(
+            coordinates_in, coordinates_out, np.array([[0, 0], [1, 1]], dtype=np.float32)
+        )
+    )
+    model = RIGNO(
+        num_outputs=2,
+        processor_steps=1,
+        node_latent_size=8,
+        edge_latent_size=8,
+        p_edge_masking=0,
+    )
+    inputs = Inputs(
+        u=torch.randn(2, 1, 40, 2),
+        c=None,
+        x_inp=None,
+        x_out=None,
+        t=torch.zeros(2, 1),
+        tau=torch.ones(2, 1),
+    )
+    output = model(inputs, graphs)
+    assert output.shape == (2, 1, 23, 2)
 
 
 def test_graph_indices_features_and_seed_are_valid():
