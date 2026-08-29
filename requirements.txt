@@ -8,3 +8,6 @@ numpy
 optax
 pandas
 seaborn
+scipy
+torch
+torch-geometric

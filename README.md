@@ -44,6 +44,12 @@ The `example.ipynb` notebook provides a minimal example on how to use the codes.
 
 ## Usage
 
+> **PyTorch Geometric port:** The `pytorch-geometric-port` branch currently
+> contains the converted RIGNO graph builder, model, and message-passing stack.
+> Dataset loading, training, evaluation, and legacy Flax checkpoint conversion
+> remain on the JAX implementation until phase two. New PyTorch checkpoints are
+> not compatible with Flax checkpoints.
+
 Create and activate a fresh virtual environment:
 ```bash
 python -m venv venv-rigno
