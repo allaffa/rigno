@@ -285,7 +285,22 @@ class RIGNO(AbstractOperator):
             raise ValueError("inputs.u must have shape [batch, 1, points, channels]")
         batch, _, points, _ = inputs.u.shape
         device, dtype = inputs.u.device, inputs.u.dtype
-        graphs = graphs.to(device)
+        graph_device = graphs.p2r.node_features["pnodes"].device
+        if graph_device != device:
+            graphs = graphs.to(device)
+        for name, coordinates, expected in (
+            ("x_inp", inputs.x_inp, graphs.p2r.node_features["pnodes"].shape[0]),
+            ("x_out", inputs.x_out, graphs.r2p.node_features["pnodes"].shape[0]),
+        ):
+            if coordinates is None or coordinates.ndim != 4:
+                raise ValueError(f"inputs.{name} must have shape [batch, 1, points, dimensions]")
+            if coordinates.shape[0] not in (1, batch) or coordinates.shape[1] != 1:
+                raise ValueError(f"inputs.{name} must have shape [batch, 1, points, dimensions]")
+            if coordinates.shape[2] != expected:
+                raise ValueError(
+                    f"inputs.{name} has {coordinates.shape[2]} points, "
+                    f"but its graph expects {expected}"
+                )
         features = inputs.u[:, 0]
         input_node_count = graphs.p2r.node_features["pnodes"].shape[0]
         if points != input_node_count:

@@ -96,8 +96,8 @@ def test_rigno_rejects_input_mesh_size_mismatch():
     inputs = Inputs(
         u=torch.randn(2, 1, 31, 1),
         c=None,
-        x_inp=None,
-        x_out=None,
+        x_inp=torch.from_numpy(coordinates).reshape(1, 1, 32, 2),
+        x_out=torch.from_numpy(coordinates).reshape(1, 1, 32, 2),
         t=torch.zeros(2, 1),
         tau=torch.ones(2, 1),
     )
@@ -125,13 +125,33 @@ def test_rigno_supports_distinct_output_mesh():
     inputs = Inputs(
         u=torch.randn(2, 1, 40, 2),
         c=None,
-        x_inp=None,
-        x_out=None,
+        x_inp=torch.from_numpy(coordinates_in).reshape(1, 1, 40, 2),
+        x_out=torch.from_numpy(coordinates_out).reshape(1, 1, 23, 2),
         t=torch.zeros(2, 1),
         tau=torch.ones(2, 1),
     )
     output = model(inputs, graphs)
     assert output.shape == (2, 1, 23, 2)
+
+
+def test_rigno_rejects_coordinate_graph_size_mismatch():
+    rng = np.random.default_rng(19)
+    coordinates = rng.uniform(0, 1, size=(32, 2)).astype(np.float32)
+    builder = RegionInteractionGraphBuilder(False, 1, 2, 1.5, 1.5, 4)
+    graphs = builder.build_graphs(
+        builder.build_metadata(coordinates, coordinates, np.array([[0, 0], [1, 1]]))
+    )
+    model = RIGNO(num_outputs=1, processor_steps=1, node_latent_size=8, edge_latent_size=8)
+    inputs = Inputs(
+        u=torch.randn(1, 1, 32, 1),
+        c=None,
+        x_inp=torch.randn(1, 1, 31, 2),
+        x_out=torch.from_numpy(coordinates).reshape(1, 1, 32, 2),
+        t=torch.zeros(1, 1),
+        tau=torch.ones(1, 1),
+    )
+    with pytest.raises(ValueError, match="inputs.x_inp has 31 points.*graph expects 32"):
+        model(inputs, graphs)
 
 
 def test_graph_indices_features_and_seed_are_valid():

@@ -16,6 +16,7 @@ class ConditionedNorm(nn.Module):
         )
         for module in (self.scale[0], self.scale[2], self.bias[0], self.bias[2]):
             nn.init.normal_(module.weight, std=0.01)
+            nn.init.zeros_(module.bias)
 
     def forward(self, x, condition):
         condition = condition.reshape(condition.shape[0], -1)[:, :1].to(
