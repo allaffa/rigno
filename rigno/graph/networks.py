@@ -6,7 +6,21 @@ from rigno.models.utils import FeedForwardBlock
 
 
 class InteractionNetworkLayer(MessagePassing):
-    """Edge-first interaction network with mean aggregation and residual updates."""
+    """Apply one residual interaction-network message-passing step.
+
+    The layer first updates every edge from its current features and the latent
+    states of its sender and receiver. Updated edge features are then averaged
+    at each receiver node, and a node MLP produces a residual receiver update.
+    A shared graph topology is vectorized across the batch using offset indices.
+
+    Args:
+        node_latent_size: Width of sender and receiver latent states.
+        edge_latent_size: Width of latent edge states.
+        mlp_hidden_layers: Number of hidden transformations in each update MLP.
+        conditioned_normalization: Whether update MLP outputs are conditioned
+            on a scalar such as the requested time increment.
+        cond_norm_hidden_size: Hidden width of the conditioning networks.
+    """
 
     def __init__(
         self,
@@ -26,6 +40,21 @@ class InteractionNetworkLayer(MessagePassing):
         self.node_mlp = FeedForwardBlock([node_latent_size] * (mlp_hidden_layers + 1), **kwargs)
 
     def forward(self, sender, receiver, edge_index, edge_attr, condition=None):
+        """Update edges and receiver nodes.
+
+        Args:
+            sender: Sender-node states with shape ``[B, N_s, F_n]``.
+            receiver: Receiver-node states with shape ``[B, N_r, F_n]``.
+            edge_index: Shared directed topology with shape ``[2, E]``.
+            edge_attr: Edge states with shape ``[E, F_e]`` (shared across the
+                batch) or ``[B, E, F_e]`` (one state per sample).
+            condition: Optional per-sample conditioning values of shape
+                ``[B, 1]`` or any shape flattenable to one scalar per sample.
+
+        Returns:
+            A pair ``(receiver_states, edge_states)`` with shapes
+            ``[B, N_r, F_n]`` and ``[B, E, F_e]`` respectively.
+        """
         batch_size, num_senders, _ = sender.shape
         num_receivers = receiver.shape[1]
         num_edges = edge_index.shape[1]
@@ -67,4 +96,5 @@ class InteractionNetworkLayer(MessagePassing):
         )
 
     def message(self, edge_attr):
+        """Use updated edge states directly as messages for mean aggregation."""
         return edge_attr

@@ -6,6 +6,13 @@ from torch import nn
 
 
 class ConditionedNorm(nn.Module):
+    """Apply a learned affine correction controlled by a scalar condition.
+
+    Two small networks map one condition per sample to multiplicative and
+    additive corrections. The correction broadcasts over any node or edge
+    dimensions in ``x`` while preserving its final feature dimension.
+    """
+
     def __init__(self, latent_size: int, correction_size: int):
         super().__init__()
         self.scale = nn.Sequential(
@@ -19,6 +26,13 @@ class ConditionedNorm(nn.Module):
             nn.init.zeros_(module.bias)
 
     def forward(self, x, condition):
+        """Condition ``x`` and return a tensor of the same shape.
+
+        Args:
+            x: Feature tensor whose first axis is the sample/item axis and whose
+                final axis has ``correction_size`` entries.
+            condition: Scalar condition for each item in the first axis.
+        """
         condition = condition.reshape(condition.shape[0], -1)[:, :1].to(
             dtype=x.dtype, device=x.device
         )
@@ -29,6 +43,15 @@ class ConditionedNorm(nn.Module):
 
 
 class FeedForwardBlock(nn.Module):
+    """Configurable MLP used for graph embeddings and residual updates.
+
+    Input tensors are concatenated along their feature axis. The first linear
+    layer is lazy so the input width can be inferred on first use; output widths
+    are supplied through ``layer_sizes``. SiLU activations separate linear
+    layers, with optional LayerNorm and condition-dependent affine correction
+    applied to the final representation.
+    """
+
     def __init__(
         self,
         layer_sizes: Sequence[int],
@@ -55,6 +78,7 @@ class FeedForwardBlock(nn.Module):
         )
 
     def forward(self, *inputs, condition=None):
+        """Concatenate compatible inputs and produce the configured features."""
         output = self.norm(self.layers(torch.cat(inputs, dim=-1)))
         if self.conditioned_norm is not None:
             if condition is None:

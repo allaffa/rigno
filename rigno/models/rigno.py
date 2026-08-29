@@ -14,6 +14,13 @@ from rigno.models.utils import FeedForwardBlock
 
 @dataclass(frozen=True)
 class RegionInteractionGraphMetadata:
+    """NumPy representation of the geometry needed to instantiate RIGNO graphs.
+
+    Coordinates are normalized to ``[-1, 1]``. Edge arrays have shape ``[E, 2]``
+    and store ``(sender, receiver)`` indices. ``r2r_edge_domains`` identifies
+    periodic image domains for the two endpoints of each regional edge.
+    """
+
     x_pnodes_inp: np.ndarray
     x_pnodes_out: np.ndarray
     x_rnodes: np.ndarray
@@ -26,18 +33,37 @@ class RegionInteractionGraphMetadata:
 
 @dataclass(frozen=True)
 class RegionInteractionGraphSet:
+    """The physical-to-regional, regional, and regional-to-physical graphs."""
+
     p2r: TypedGraph
     r2r: TypedGraph
     r2p: TypedGraph
 
     def to(self, device):
+        """Return a graph set with all tensors moved to ``device``."""
         return RegionInteractionGraphSet(
             self.p2r.to(device), self.r2r.to(device), self.r2p.to(device)
         )
 
 
 class RegionInteractionGraphBuilder:
-    """Construct physical/regional multiscale graphs using NumPy and SciPy."""
+    """Construct RIGNO's three geometry-dependent graphs.
+
+    Physical input nodes are randomly subsampled to form a smaller regional
+    mesh. Delaunay edges from progressively coarser prefixes of that mesh form
+    the multiscale processor graph. Radius-based edges map input physical nodes
+    to regional nodes and regional nodes to arbitrary output physical nodes.
+
+    Args:
+        periodic: Treat the normalized domain as periodic in every dimension.
+        rmesh_levels: Number of regional coarsening levels contributing edges.
+        subsample_factor: Reduction factor used for the regional mesh and each
+            subsequent coarsening level.
+        overlap_factor_p2r: Multiplier for physical-to-regional support radii.
+        overlap_factor_r2p: Multiplier for regional-to-physical support radii.
+        node_coordinate_freqs: Number of Fourier frequencies per coordinate for
+            periodic node features; ignored for non-periodic domains.
+    """
 
     _domain_shifts = np.array(
         [[0, 0], [-2, 0], [-2, 2], [0, 2], [2, 2], [2, 0], [2, -2], [0, -2], [-2, -2]],
@@ -61,6 +87,11 @@ class RegionInteractionGraphBuilder:
         self.node_coordinate_freqs = node_coordinate_freqs
 
     def _support_radii(self, x):
+        """Compute a coverage radius for each ``[N_r, 2]`` regional point.
+
+        Radii are derived from medians of neighboring Delaunay triangles. For a
+        periodic domain, triangulation includes the eight neighboring images.
+        """
         extended = (x[None] + self._domain_shifts[:, None]).reshape(-1, 2) if self.periodic else x
         tri = Delaunay(extended)
         medians = _compute_triangulation_medians(tri)
@@ -73,6 +104,12 @@ class RegionInteractionGraphBuilder:
         return radii
 
     def _support_edges(self, centers, points, radii):
+        """Return ``(point, center)`` pairs lying inside center support regions.
+
+        ``centers`` and ``points`` are normalized 2-D coordinates and ``radii``
+        supplies one Euclidean support radius per center. Periodic distances use
+        the shortest wrapped displacement.
+        """
         rel = points[:, None] - centers[None]
         if self.periodic:
             rel = np.where(rel >= 1, rel - 2, rel)
@@ -81,6 +118,16 @@ class RegionInteractionGraphBuilder:
         return np.stack(np.where(np.linalg.norm(rel, axis=-1) <= radii[None]), axis=-1)
 
     def _r2r_edges(self, x):
+        """Build the union of directed Delaunay edges over regional scales.
+
+        Args:
+            x: Regional coordinates with shape ``[N_r, 2]``. Coarser meshes are
+                prefixes of this array, preserving the nested-node construction.
+
+        Returns:
+            Unique edge indices ``[E, 2]`` and matching endpoint periodic-domain
+            indices ``[E, 2]``.
+        """
         edge_parts, domain_parts = [], []
         for level in range(self.rmesh_levels):
             size = int(len(x) / self.subsample_factor**level)
@@ -104,6 +151,25 @@ class RegionInteractionGraphBuilder:
         return edges[unique], domains[unique]
 
     def build_metadata(self, x_inp, x_out, domain, rmesh_correction_dsf=1, seed=0):
+        """Create deterministic graph metadata from physical point clouds.
+
+        Args:
+            x_inp: Input physical coordinates with shape ``[N_in, 2]``.
+            x_out: Desired output coordinates with shape ``[N_out, 2]``; these
+                may differ in number and location from ``x_inp``.
+            domain: Lower and upper coordinate bounds with shape ``[2, 2]``.
+            rmesh_correction_dsf: Additional regional-mesh downsampling factor.
+                Values below one instead add simplex-centroid nodes.
+            seed: Seed controlling regional-node sampling and upsampling.
+
+        Returns:
+            :class:`RegionInteractionGraphMetadata` containing normalized node
+            coordinates, support radii, and all three graph topologies.
+
+        Note:
+            This geometry preprocessing uses SciPy Delaunay triangulation and is
+            intentionally outside PyTorch autograd.
+        """
         x_inp, x_out, domain = map(
             lambda v: np.asarray(v, dtype=np.float32), (x_inp, x_out, domain)
         )
@@ -131,6 +197,7 @@ class RegionInteractionGraphBuilder:
         return RegionInteractionGraphMetadata(x_inp, x_out, x_rnodes, radii, p2r, r2r, domains, r2p)
 
     def _node_features(self, x, radius=None):
+        """Encode coordinates, and optionally support radius, as node features."""
         if self.periodic:
             phi = math.pi * (x + 1)
             freqs = np.arange(1, self.node_coordinate_freqs + 1)
@@ -148,6 +215,12 @@ class RegionInteractionGraphBuilder:
         return torch.as_tensor(features, dtype=torch.float32)
 
     def _edge_set(self, sender_name, receiver_name, x_sender, x_receiver, indices, domains=None):
+        """Create an :class:`EdgeSet` with normalized displacement features.
+
+        Each edge receives its coordinate displacement and Euclidean length,
+        producing three structural features in two dimensions. ``domains`` is
+        used only for regional edges crossing a periodic boundary.
+        """
         source, target = indices[:, 0], indices[:, 1]
         rel = x_sender[source] - x_receiver[target]
         if self.periodic:
@@ -173,6 +246,13 @@ class RegionInteractionGraphBuilder:
         )
 
     def build_graphs(self, metadata):
+        """Convert geometry metadata into PyTorch typed graphs.
+
+        Returns:
+            A :class:`RegionInteractionGraphSet` containing ``p2r``, ``r2r``,
+            and ``r2p`` graphs. Graph tensors initially reside on the CPU and
+            contain unbatched structural features shared by all samples.
+        """
         xp, xo, xr, rr = (
             metadata.x_pnodes_inp,
             metadata.x_pnodes_out,
@@ -210,7 +290,27 @@ class RegionInteractionGraphBuilder:
 
 
 class RIGNO(AbstractOperator):
-    """Encode-process-decode RIGNO implemented as a torch module."""
+    """Region Interaction Graph Neural Operator implemented in PyTorch/PyG.
+
+    The encoder aggregates input solution/coefficient values from physical
+    nodes onto a downsampled regional mesh. A multiscale graph processor evolves
+    regional latent states, and the decoder maps them to the requested output
+    point cloud. The model is data-driven: it predicts fields from examples and
+    does not evaluate or penalize a PDE residual internally.
+
+    Args:
+        num_outputs: Number of predicted channels at each output point.
+        processor_steps: Number of regional message-passing layers.
+        node_latent_size: Width of all latent node states.
+        edge_latent_size: Width of all latent edge states.
+        mlp_hidden_layers: Number of hidden transformations in each MLP.
+        concatenate_t: Append current time to every input physical node.
+        concatenate_tau: Append requested lead time to every input node.
+        conditioned_normalization: Condition graph updates on lead time.
+        cond_norm_hidden_size: Hidden width of condition embedding networks.
+        p_edge_masking: Training-time fraction of edges randomly dropped from
+            each graph as a resolution-robustness regularizer.
+    """
 
     def __init__(
         self,
@@ -266,6 +366,7 @@ class RIGNO(AbstractOperator):
 
     @staticmethod
     def _channel(value, batch, device, dtype):
+        """Convert a scalar or batched value to a ``[batch, 1]`` tensor."""
         if value is None:
             return None
         value = torch.as_tensor(value, device=device, dtype=dtype)
@@ -274,6 +375,7 @@ class RIGNO(AbstractOperator):
         return value.reshape(batch, -1)[:, :1]
 
     def _masked(self, edge):
+        """Return all edges at evaluation or a random training-time subset."""
         if not self.training or self.p_edge_masking <= 0:
             return edge.edge_index, edge.features
         keep = max(1, int((1 - self.p_edge_masking) * edge.features.shape[0]))
@@ -281,6 +383,25 @@ class RIGNO(AbstractOperator):
         return edge.edge_index[:, chosen], edge.features[chosen]
 
     def forward(self, inputs: Inputs, graphs: RegionInteractionGraphSet):
+        """Predict a field on the output physical mesh.
+
+        Args:
+            inputs: Operator inputs. ``u`` must have shape
+                ``[B, 1, N_in, C_u]``; optional ``c`` must match its first three
+                axes. Coordinate point counts must agree with their graph node
+                sets. ``t`` and ``tau`` are required when their corresponding
+                concatenation options are enabled.
+            graphs: Geometry-specific p2r/r2r/r2p graphs, shared across the
+                samples in the batch. They are moved to ``inputs.u.device`` only
+                when necessary.
+
+        Returns:
+            Predicted values with shape ``[B, 1, N_out, num_outputs]``.
+
+        Raises:
+            ValueError: If tensor ranks, batch sizes, point counts, or required
+                temporal inputs are inconsistent with the model and graphs.
+        """
         if inputs.u.ndim != 4 or inputs.u.shape[1] != 1:
             raise ValueError("inputs.u must have shape [batch, 1, points, channels]")
         batch, _, points, _ = inputs.u.shape
@@ -363,6 +484,7 @@ class RIGNO(AbstractOperator):
 
 
 def _edges_from_triangulation(tri):
+    """Extract directed neighbor pairs ``[E, 2]`` from a SciPy triangulation."""
     indptr, cols = tri.vertex_neighbor_vertices
     rows = np.repeat(np.arange(len(indptr) - 1), np.diff(indptr))
     edges = np.stack([rows, cols], axis=-1)
@@ -370,6 +492,7 @@ def _edges_from_triangulation(tri):
 
 
 def _compute_triangulation_medians(tri):
+    """Compute scaled triangle medians used to define node support radii."""
     edges, medians = np.zeros(tri.simplices.shape), np.zeros(tri.simplices.shape)
     for i in range(tri.simplices.shape[1]):
         left, right = [
@@ -384,6 +507,7 @@ def _compute_triangulation_medians(tri):
 
 
 def _upsample(x, factor, rng):
+    """Add sampled Delaunay-simplex centroids to increase a point set's density."""
     count = int(len(x) * (factor ** x.shape[-1] - 1))
     simplices = rng.permutation(Delaunay(x).simplices)[:count]
     return np.concatenate([x, np.mean(x[simplices], axis=1)])
