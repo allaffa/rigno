@@ -38,5 +38,8 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install --requirement requirements.txt
 
+      - name: Check formatting
+        run: python -m black --check rigno/__init__.py rigno/graph rigno/models tests
+
       - name: Run tests
         run: python -m pytest -q tests

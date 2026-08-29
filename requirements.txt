@@ -1,4 +1,5 @@
 absl-py
+black==26.5.1
 flax
 h5py
 jax # [cuda12]
