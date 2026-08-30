@@ -7,7 +7,7 @@ from scipy.spatial import Delaunay
 import torch
 
 from rigno.graph.entities import EdgeSet, TypedGraph
-from rigno.models.graphnet import BipartiteGraphNet, ProcessorGraphNet
+from rigno.models.graphnet import BipartiteGraphNet, MultigridProcessorGraphNet, ProcessorGraphNet
 from rigno.models.operator import AbstractOperator, Inputs
 from rigno.models.utils import FeedForwardBlock
 
@@ -18,7 +18,9 @@ class RegionInteractionGraphMetadata:
 
     Coordinates are normalized to ``[-1, 1]``. Edge arrays have shape ``[E, 2]``
     and store ``(sender, receiver)`` indices. ``r2r_edge_domains`` identifies
-    periodic image domains for the two endpoints of each regional edge.
+    periodic image domains for the two endpoints of each regional edge. The
+    ``multigrid_*`` tuples store explicit fine-to-coarse levels, same-level
+    topology, and hard cluster assignments for the optional MG-GNN processor.
     """
 
     x_pnodes_inp: np.ndarray
@@ -29,6 +31,33 @@ class RegionInteractionGraphMetadata:
     r2r_edge_indices: np.ndarray
     r2r_edge_domains: np.ndarray
     r2p_edge_indices: np.ndarray
+    multigrid_coordinates: tuple[np.ndarray, ...] = ()
+    multigrid_radii: tuple[np.ndarray, ...] = ()
+    multigrid_edge_indices: tuple[np.ndarray, ...] = ()
+    multigrid_edge_domains: tuple[np.ndarray, ...] = ()
+    multigrid_assignments: tuple[np.ndarray, ...] = ()
+
+
+@dataclass(frozen=True)
+class MultigridGraphSet:
+    """Explicit graph hierarchy and adjacent-level transfer edges.
+
+    ``levels`` runs from the finest regional graph to the coarsest. For every
+    adjacent pair, ``down_edges`` maps each fine node to its cluster and
+    ``up_edges`` provides the reverse connection.
+    """
+
+    levels: tuple[TypedGraph, ...]
+    down_edges: tuple[EdgeSet, ...]
+    up_edges: tuple[EdgeSet, ...]
+
+    def to(self, device):
+        """Return a hierarchy with every tensor moved to ``device``."""
+        return MultigridGraphSet(
+            tuple(graph.to(device) for graph in self.levels),
+            tuple(edge.to(device) for edge in self.down_edges),
+            tuple(edge.to(device) for edge in self.up_edges),
+        )
 
 
 @dataclass(frozen=True)
@@ -38,11 +67,13 @@ class RegionInteractionGraphSet:
     p2r: TypedGraph
     r2r: TypedGraph
     r2p: TypedGraph
+    multigrid: MultigridGraphSet | None = None
 
     def to(self, device):
         """Return a graph set with all tensors moved to ``device``."""
+        hierarchy = None if self.multigrid is None else self.multigrid.to(device)
         return RegionInteractionGraphSet(
-            self.p2r.to(device), self.r2r.to(device), self.r2p.to(device)
+            self.p2r.to(device), self.r2r.to(device), self.r2p.to(device), hierarchy
         )
 
 
@@ -150,7 +181,88 @@ class RegionInteractionGraphBuilder:
         _, unique = np.unique(edges, axis=0, return_index=True)
         return edges[unique], domains[unique]
 
-    def build_metadata(self, x_inp, x_out, domain, rmesh_correction_dsf=1, seed=0):
+    def _single_level_edges(self, x):
+        """Return Delaunay edges and periodic domains for one graph level."""
+        size = len(x)
+        if size < 4:
+            raise ValueError("each multigrid level needs at least four regional nodes")
+        extended = (x[None] + self._domain_shifts[:, None]).reshape(-1, 2) if self.periodic else x
+        extended_edges = _edges_from_triangulation(Delaunay(extended))
+        domains, edges = extended_edges // size, extended_edges % size
+        keep = np.any(domains == 0, axis=1) if self.periodic else np.all(domains == 0, axis=1)
+        edges, domains = edges[keep], domains[keep]
+        _, unique = np.unique(edges, axis=0, return_index=True)
+        return edges[unique], domains[unique]
+
+    def _cluster_level(self, points, count, rng):
+        """Cluster one graph level and return centers plus fine-to-coarse labels.
+
+        This deterministic-seed Lloyd iteration implements the assignment
+        matrix used by MG-GNN without adding a scikit-learn dependency. Periodic
+        clusters are averaged in locally unwrapped coordinates.
+        """
+        if not 4 <= count < len(points):
+            raise ValueError("coarse level size must be at least four and smaller than fine size")
+        centers = points[rng.choice(len(points), size=count, replace=False)].copy()
+        labels = np.zeros(len(points), dtype=np.int64)
+        for _ in range(50):
+            rel = points[:, None] - centers[None]
+            if self.periodic:
+                rel = np.where(rel >= 1, rel - 2, rel)
+                rel = np.where(rel < -1, rel + 2, rel)
+            new_labels = np.argmin(np.sum(rel**2, axis=-1), axis=1)
+            new_centers = centers.copy()
+            nearest_distance = np.min(np.sum(rel**2, axis=-1), axis=1)
+            cluster_sizes = np.bincount(new_labels, minlength=count)
+            for cluster in range(count):
+                if cluster_sizes[cluster] == 0:
+                    movable = cluster_sizes[new_labels] > 1
+                    replacement = int(np.argmax(np.where(movable, nearest_distance, -1)))
+                    cluster_sizes[new_labels[replacement]] -= 1
+                    new_labels[replacement] = cluster
+                    cluster_sizes[cluster] += 1
+                    nearest_distance[replacement] = -1
+                members = points[new_labels == cluster]
+                if self.periodic:
+                    anchor = members[0]
+                    offsets = members - anchor
+                    offsets = np.where(offsets >= 1, offsets - 2, offsets)
+                    offsets = np.where(offsets < -1, offsets + 2, offsets)
+                    new_centers[cluster] = (anchor + offsets.mean(axis=0) + 1) % 2 - 1
+                else:
+                    new_centers[cluster] = members.mean(axis=0)
+            if np.array_equal(labels, new_labels) and np.allclose(centers, new_centers):
+                centers, labels = new_centers, new_labels
+                break
+            centers, labels = new_centers, new_labels
+        return centers.astype(np.float32), labels
+
+    def _build_multigrid_metadata(self, x, rng):
+        """Build explicit clustered graph levels and adjacent assignments."""
+        coordinates, radii, edges, domains, assignments = [x], [], [], [], []
+        for level in range(self.rmesh_levels):
+            level_radii = self._support_radii(coordinates[-1])
+            level_edges, level_domains = self._single_level_edges(coordinates[-1])
+            radii.append(level_radii)
+            edges.append(level_edges)
+            domains.append(level_domains)
+            if level == self.rmesh_levels - 1:
+                break
+            coarse_count = int(len(coordinates[-1]) / self.subsample_factor)
+            if coarse_count < 4 or coarse_count >= len(coordinates[-1]):
+                break
+            coarse, labels = self._cluster_level(coordinates[-1], coarse_count, rng)
+            coordinates.append(coarse)
+            assignments.append(labels)
+        return (
+            tuple(coordinates),
+            tuple(radii),
+            tuple(edges),
+            tuple(domains),
+            tuple(assignments),
+        )
+
+    def build_metadata(self, x_inp, x_out, domain, rmesh_correction_dsf=1, seed=0, build_multigrid=False):
         """Create deterministic graph metadata from physical point clouds.
 
         Args:
@@ -161,10 +273,16 @@ class RegionInteractionGraphBuilder:
             rmesh_correction_dsf: Additional regional-mesh downsampling factor.
                 Values below one instead add simplex-centroid nodes.
             seed: Seed controlling regional-node sampling and upsampling.
+            build_multigrid: When ``True``, compute the explicit clustered graph
+                hierarchy required by the ``"multigrid"`` processor.  Defaults to
+                ``False`` so the default ``"multiscale"`` path incurs no extra
+                preprocessing or memory cost.
 
         Returns:
             :class:`RegionInteractionGraphMetadata` containing normalized node
-            coordinates, support radii, and all three graph topologies.
+            coordinates, support radii, and all three graph topologies.  The
+            ``multigrid_*`` fields are populated only when ``build_multigrid``
+            is ``True``.
 
         Note:
             This geometry preprocessing uses SciPy Delaunay triangulation and is
@@ -194,7 +312,18 @@ class RegionInteractionGraphBuilder:
             ),
             axis=-1,
         )
-        return RegionInteractionGraphMetadata(x_inp, x_out, x_rnodes, radii, p2r, r2r, domains, r2p)
+        hierarchy = self._build_multigrid_metadata(x_rnodes, rng) if build_multigrid else ((), (), (), (), ())
+        return RegionInteractionGraphMetadata(
+            x_inp,
+            x_out,
+            x_rnodes,
+            radii,
+            p2r,
+            r2r,
+            domains,
+            r2p,
+            *hierarchy,
+        )
 
     def _node_features(self, x, radius=None):
         """Encode coordinates, and optionally support radius, as node features."""
@@ -250,8 +379,9 @@ class RegionInteractionGraphBuilder:
 
         Returns:
             A :class:`RegionInteractionGraphSet` containing ``p2r``, ``r2r``,
-            and ``r2p`` graphs. Graph tensors initially reside on the CPU and
-            contain unbatched structural features shared by all samples.
+            and ``r2p`` graphs plus an explicit multigrid hierarchy. Graph
+            tensors initially reside on the CPU and contain unbatched structural
+            features shared by all samples.
         """
         xp, xo, xr, rr = (
             metadata.x_pnodes_inp,
@@ -264,6 +394,38 @@ class RegionInteractionGraphBuilder:
             self._node_features(xo),
             self._node_features(xr, rr),
         )
+        levels = tuple(
+            TypedGraph(
+                {"rnodes": self._node_features(x_level, r_level)},
+                {
+                    "r2r": self._edge_set(
+                        "rnodes",
+                        "rnodes",
+                        x_level,
+                        x_level,
+                        edge_indices,
+                        edge_domains,
+                    )
+                },
+            )
+            for x_level, r_level, edge_indices, edge_domains in zip(
+                metadata.multigrid_coordinates,
+                metadata.multigrid_radii,
+                metadata.multigrid_edge_indices,
+                metadata.multigrid_edge_domains,
+            )
+        )
+        down_edges, up_edges = [], []
+        for level, assignment in enumerate(metadata.multigrid_assignments):
+            fine, coarse = (
+                metadata.multigrid_coordinates[level],
+                metadata.multigrid_coordinates[level + 1],
+            )
+            down_indices = np.stack([np.arange(len(fine)), assignment], axis=-1)
+            up_indices = np.flip(down_indices, axis=-1).copy()
+            down_edges.append(self._edge_set("rnodes", "rnodes", fine, coarse, down_indices))
+            up_edges.append(self._edge_set("rnodes", "rnodes", coarse, fine, up_indices))
+        hierarchy = MultigridGraphSet(levels, tuple(down_edges), tuple(up_edges))
         return RegionInteractionGraphSet(
             TypedGraph(
                 {"pnodes": pnodes_in, "rnodes": rnodes},
@@ -286,6 +448,7 @@ class RegionInteractionGraphBuilder:
                 {"rnodes": rnodes, "pnodes": pnodes_out},
                 {"r2p": self._edge_set("rnodes", "pnodes", xr, xo, metadata.r2p_edge_indices)},
             ),
+            hierarchy,
         )
 
 
@@ -310,6 +473,9 @@ class RIGNO(AbstractOperator):
         cond_norm_hidden_size: Hidden width of condition embedding networks.
         p_edge_masking: Training-time fraction of edges randomly dropped from
             each graph as a resolution-robustness regularizer.
+        processor_type: ``"multiscale"`` for the original union-edge processor
+            or ``"multigrid"`` for parallel MG-GNN cross-level propagation.
+        multigrid_levels: Number of explicit graph levels used by MG-GNN.
     """
 
     def __init__(
@@ -324,13 +490,18 @@ class RIGNO(AbstractOperator):
         conditioned_normalization=True,
         cond_norm_hidden_size=16,
         p_edge_masking=0.5,
+        processor_type="multiscale",
+        multigrid_levels=2,
     ):
         super().__init__()
+        if processor_type not in {"multiscale", "multigrid"}:
+            raise ValueError("processor_type must be 'multiscale' or 'multigrid'")
         self.num_outputs, self.concatenate_t, self.concatenate_tau = (
             num_outputs,
             concatenate_t,
             concatenate_tau,
         )
+        self.processor_type = processor_type
         self.conditioned_normalization, self.p_edge_masking = (
             conditioned_normalization,
             p_edge_masking,
@@ -343,7 +514,11 @@ class RIGNO(AbstractOperator):
             cond_norm_hidden_size,
         )
         self.encoder = BipartiteGraphNet(*common)
-        self.processor = ProcessorGraphNet(processor_steps, *common)
+        self.processor = (
+            ProcessorGraphNet(processor_steps, *common)
+            if processor_type == "multiscale"
+            else MultigridProcessorGraphNet(processor_steps, multigrid_levels, *common)
+        )
         self.decoder = BipartiteGraphNet(
             *common, embed_nodes=False, embed_sender=False, embed_receiver=True
         )
@@ -361,6 +536,8 @@ class RIGNO(AbstractOperator):
             conditioned_normalization=conditioned_normalization,
             cond_norm_hidden_size=cond_norm_hidden_size,
             p_edge_masking=p_edge_masking,
+            processor_type=processor_type,
+            multigrid_levels=multigrid_levels,
         )
         self.intermediates = {}
 
@@ -463,9 +640,19 @@ class RIGNO(AbstractOperator):
             condition,
         )
         encoded_r = latent_r
-        edge = graphs.r2r.edge_by_name("r2r")
-        edge_index, edge_attr = self._masked(edge)
-        latent_r = self.processor(latent_r, edge_index, edge_attr.to(dtype), condition)
+        if self.processor_type == "multiscale":
+            edge = graphs.r2r.edge_by_name("r2r")
+            edge_index, edge_attr = self._masked(edge)
+            latent_r = self.processor(latent_r, edge_index, edge_attr.to(dtype), condition)
+        else:
+            if graphs.multigrid is None:
+                raise ValueError("multigrid processor requires a multigrid graph hierarchy")
+            latent_r = self.processor(
+                latent_r,
+                graphs.multigrid,
+                condition,
+                edge_masker=self._masked,
+            )
         edge = graphs.r2p.edge_by_name("r2p")
         edge_index, edge_attr = self._masked(edge)
         output_struct = (
