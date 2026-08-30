@@ -20,7 +20,7 @@ def _build_hierarchy(num_input=96, num_output=None, levels=3, seed=23):
         node_coordinate_freqs=4,
     )
     metadata = builder.build_metadata(
-        x_inp, x_out, np.array([[0, 0], [1, 1]], dtype=np.float32), seed=seed
+        x_inp, x_out, np.array([[0, 0], [1, 1]], dtype=np.float32), seed=seed, build_multigrid=True
     )
     return x_inp, x_out, metadata, builder.build_graphs(metadata)
 

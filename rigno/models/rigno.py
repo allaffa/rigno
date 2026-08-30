@@ -262,7 +262,7 @@ class RegionInteractionGraphBuilder:
             tuple(assignments),
         )
 
-    def build_metadata(self, x_inp, x_out, domain, rmesh_correction_dsf=1, seed=0):
+    def build_metadata(self, x_inp, x_out, domain, rmesh_correction_dsf=1, seed=0, build_multigrid=False):
         """Create deterministic graph metadata from physical point clouds.
 
         Args:
@@ -273,10 +273,16 @@ class RegionInteractionGraphBuilder:
             rmesh_correction_dsf: Additional regional-mesh downsampling factor.
                 Values below one instead add simplex-centroid nodes.
             seed: Seed controlling regional-node sampling and upsampling.
+            build_multigrid: When ``True``, compute the explicit clustered graph
+                hierarchy required by the ``"multigrid"`` processor.  Defaults to
+                ``False`` so the default ``"multiscale"`` path incurs no extra
+                preprocessing or memory cost.
 
         Returns:
             :class:`RegionInteractionGraphMetadata` containing normalized node
-            coordinates, support radii, and all three graph topologies.
+            coordinates, support radii, and all three graph topologies.  The
+            ``multigrid_*`` fields are populated only when ``build_multigrid``
+            is ``True``.
 
         Note:
             This geometry preprocessing uses SciPy Delaunay triangulation and is
@@ -306,7 +312,7 @@ class RegionInteractionGraphBuilder:
             ),
             axis=-1,
         )
-        hierarchy = self._build_multigrid_metadata(x_rnodes, rng)
+        hierarchy = self._build_multigrid_metadata(x_rnodes, rng) if build_multigrid else ((), (), (), (), ())
         return RegionInteractionGraphMetadata(
             x_inp,
             x_out,
