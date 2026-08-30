@@ -51,6 +51,40 @@ The `example.ipynb` notebook provides a minimal example on how to use the codes.
 > intentionally unavailable with the PyTorch model until phase two. New PyTorch
 > checkpoints are not compatible with Flax checkpoints.
 
+### Optional MG-GNN processor
+
+The PyTorch port includes an optional multigrid processor inspired by the
+parallel cross-scale architecture in *MG-GNN: Multigrid Graph Neural Networks
+for Learning Multilevel Domain Decomposition Methods*. Unlike RIGNO's default
+processor, which combines multiple edge scales in one regional graph, this mode
+constructs separate clustered graph levels and exchanges learned messages in
+both directions between adjacent levels during every processor step.
+
+The graph builder uses `rmesh_levels` to construct the available hierarchy. The
+model selects how many of those levels to consume:
+
+```python
+builder = RegionInteractionGraphBuilder(
+    periodic=False,
+    rmesh_levels=3,
+    subsample_factor=2,
+    overlap_factor_p2r=1.5,
+    overlap_factor_r2p=1.5,
+    node_coordinate_freqs=4,
+)
+
+model = RIGNO(
+    num_outputs=2,
+    processor_type="multigrid",
+    multigrid_levels=3,
+)
+```
+
+Coarse coordinates are k-means cluster centers, so they are newly constructed
+representatives rather than a subset of fine nodes. Assignment edges cover
+every fine node and are retained during edge masking. The default
+`processor_type="multiscale"` preserves the original port's behavior.
+
 On Linux, create the virtual environment and install all dependencies with:
 ```bash
 ./install_linux.sh
